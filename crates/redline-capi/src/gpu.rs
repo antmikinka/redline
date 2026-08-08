@@ -51,6 +51,9 @@ struct HipFns {
     stream_wait_value32:
         unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, u32) -> i32,
     malloc: unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize) -> i32,
+    /// Prefer for WaitValue fences (`hipMallocSignalMemory`).
+    ext_malloc_with_flags:
+        Option<unsafe extern "C" fn(*mut *mut std::ffi::c_void, usize, u32) -> i32>,
     free: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     memcpy: unsafe extern "C" fn(
         *mut std::ffi::c_void,
@@ -76,6 +79,7 @@ fn hip_fns() -> Option<&'static HipFns> {
                 stream_write_value32: *lib.get(b"hipStreamWriteValue32\0").ok()?,
                 stream_wait_value32: *lib.get(b"hipStreamWaitValue32\0").ok()?,
                 malloc: *lib.get(b"hipMalloc\0").ok()?,
+                ext_malloc_with_flags: lib.get(b"hipExtMallocWithFlags\0").ok().map(|s| *s),
                 free: *lib.get(b"hipFree\0").ok()?,
                 memcpy: *lib.get(b"hipMemcpy\0").ok()?,
             })
@@ -88,8 +92,12 @@ fn hip_fns() -> Option<&'static HipFns> {
 const HIP_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 // hipStreamWaitValueGte
 const HIP_STREAM_WAIT_VALUE_GTE: u32 = 0x0;
-// hipStreamWaitValueEq  
+// hipStreamWaitValueEq
 const HIP_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
+// hipStreamWaitValue32 mask: compare all bits (docs default; 0 is not portable).
+const HIP_STREAM_WAIT_VALUE_MASK_ALL: u32 = 0xffff_ffff;
+// hipMallocSignalMemory — required by hipStreamWaitValue32 docs.
+const HIP_MALLOC_SIGNAL_MEMORY: u32 = 0x2;
 
 static PIPELINE_SEQ: AtomicU32 = AtomicU32::new(1);
 /// Last seq written by WRITE_DATA consumer fence (for hipStreamWaitValue32).
@@ -124,9 +132,23 @@ fn pipeline_fence_addr() -> Option<u64> {
     let hip = hip_fns()?;
     Some(*PIPELINE_FENCE.get_or_init(|| {
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-        let st = unsafe { (hip.malloc)(&mut p, 8) };
+        // hipStreamWaitValue32 requires hipMallocSignalMemory (HIP beta API).
+        // Plain hipMalloc worked for WriteValue + WAIT_REG_MEM (phase2 sync) but
+        // Path B consumer WaitValue hung on gfx1150 with ordinary device memory
+        // (lemon pathb-B1async 20260808-141844 rc=124, no Generation).
+        let st = if let Some(ext) = hip.ext_malloc_with_flags {
+            unsafe { ext(&mut p, 8, HIP_MALLOC_SIGNAL_MEMORY) }
+        } else {
+            // No ext malloc: fall back (WaitValue may still be unreliable).
+            unsafe { (hip.malloc)(&mut p, 8) }
+        };
         if st != 0 || p.is_null() {
-            return 0;
+            // Last resort: ordinary device memory (phase2 producer fence only).
+            p = std::ptr::null_mut();
+            let st2 = unsafe { (hip.malloc)(&mut p, 8) };
+            if st2 != 0 || p.is_null() {
+                return 0;
+            }
         }
         // zero prod + cons
         let z = [0u8; 8];
@@ -521,7 +543,7 @@ pub unsafe extern "C" fn rl_gpu_consumer_wait_hip_stream(
             cons as *mut std::ffi::c_void,
             seq,
             HIP_STREAM_WAIT_VALUE_EQ,
-            0,
+            HIP_STREAM_WAIT_VALUE_MASK_ALL,
         )
     };
     if st != 0 {

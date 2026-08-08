@@ -30,6 +30,16 @@ Host still joins producers via StreamSynchronize — same class of tax as lemon-
 - **Fallback:** if ROCr wait-IB init / prefix submit fails → phase1 StreamSynchronize.
 - lemon-mlx uses phase2 only if `MLX_REDLINE_PHASE2=1`; default stays phase1.
 
+### Path B status (gfx1150, 20260808-143154)
+
+| Mode | lemon env | Result |
+|------|-----------|--------|
+| WaitValue consumer | `PHASE2_ASYNC=1` + `ASYNC_WAITVALUE=1` | **HANG** (rc=124, no Generation) even after fence=`hipMallocSignalMemory` + WaitValue mask `0xFFFFFFFF` |
+| Hostwait after submit | `PHASE2_ASYNC=1` (default; no WaitValue) | **OK** gen; **not** a PRE-tax win |
+| phase2 sync | `PHASE2=1` only | OK `phase2-used` |
+
+**Hypothesis remaining:** PM4 `WRITE_DATA` does not unblock `hipStreamWaitValue32` on signal memory (or beta WaitValue is unreliable on this stack). lemon defaults async to **host `rl_pm4_wait`**.
+
 ## Phase 2b remaining
 
 1. ~~PM4 `WAIT_REG_MEM` prefix on HSA queue (no host poll)~~ **landed**  
