@@ -592,16 +592,25 @@ pub unsafe extern "C" fn rl_gpu_consumer_wait_hip_stream(
 
 /// Phase 2 async: submit retained IB without host wait. Pair with [`rl_pm4_wait`].
 ///
+/// Also publishes the completion-signal value pointer for
+/// [`rl_gpu_consumer_wait_hip_stream`] (same as phase2b submit_after) so idle-
+/// stream fast paths can skip WAIT_REG_MEM when no HIP producers are outstanding.
+///
 /// Does **not** establish HIP producer ordering by itself — use
-/// [`rl_pm4_submit_after_hip_stream_phase2`] or
-/// [`rl_pm4_replay_after_hip_stream_phase2`] for ordered OWN_RMSNORM.
+/// [`rl_pm4_submit_after_hip_stream_phase2`] when the product stream may still
+/// be writing producer VRAM.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rl_pm4_submit(ib: *mut RlPm4Ib) -> i32 {
     let Some(ib) = (unsafe { ib.as_mut() }) else {
         return RL_ERR_NULL;
     };
     match unsafe { ib.ib.submit_only() } {
-        Ok(()) => RL_OK,
+        Ok(()) => {
+            if let Some(sig_ptr) = hsa_signal_value_pointer(ib.ib.completion_signal_handle()) {
+                publish_consumer_wait(sig_ptr as u64, 0);
+            }
+            RL_OK
+        }
         Err(_) => RL_ERR_REPLAY,
     }
 }
