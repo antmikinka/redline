@@ -27,6 +27,17 @@ pub const RL_ERR_COMPILE: i32 = -4;
 pub const RL_ERR_REPLAY: i32 = -5;
 pub const RL_ERR_HANDLE: i32 = -6;
 pub const RL_ERR_CERTIFICATION: i32 = -7;
+/// HIP interop failed (missing libamdhip64, dlsym, or hipStreamSynchronize error).
+pub const RL_ERR_HIP: i32 = -8;
+
+/// Feature bit: [`gpu::rl_pm4_replay_after_hip_stream`] is available (phase-1 host wait).
+pub const RL_FEATURE_HIP_STREAM_WAIT: u32 = 1;
+
+/// Bitmask of optional C-ABI features. Lemon-mlx probes this after dlopen.
+#[unsafe(no_mangle)]
+pub extern "C" fn rl_feature_bits() -> u32 {
+    RL_FEATURE_HIP_STREAM_WAIT
+}
 
 /// Real-GPU retained-PM4 replay (engine supplies its own kernels + kernargs).
 pub mod gpu;

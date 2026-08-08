@@ -16,3 +16,4 @@ crate-type = ["staticlib", "cdylib"]
 [dependencies]
 radiowave = { path = "../radiowave" }
 redline-dispatch = { path = "../redline-dispatch" }
+libloading = "0.8.9"

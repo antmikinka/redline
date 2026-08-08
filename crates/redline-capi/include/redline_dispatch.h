@@ -26,6 +26,16 @@
 #define RL_ERR_HANDLE -6
 
 #define RL_ERR_CERTIFICATION -7
+/** HIP interop failed (missing libamdhip64 or hipStreamSynchronize error). */
+#define RL_ERR_HIP -8
+
+/** Feature bit: rl_pm4_replay_after_hip_stream / rl_gpu_wait_hip_stream present. */
+#define RL_FEATURE_HIP_STREAM_WAIT 1u
+
+/**
+ * Optional C-ABI feature bits (OR of RL_FEATURE_*). Probe after dlopen.
+ */
+uint32_t rl_feature_bits(void);
 
 /**
  * Replay tuning mode. `lanes`/`max_in_flight` are read from the call site.
@@ -611,6 +621,26 @@ int32_t rl_pm4_ib_set_kernargs(struct RlPm4Ib *ib,
  * `ib` from [`rl_pm4_finalize`], or null.
  */
 void rl_pm4_ib_free(struct RlPm4Ib *ib);
+
+/**
+ * Phase-1 HIP interop: host-join `hip_stream` via hipStreamSynchronize.
+ * Null stream is a no-op success. Returns RL_OK, RL_ERR_NULL, or RL_ERR_HIP.
+ *
+ * Phase 2 (future): device-side wait so the host need not block for producers.
+ *
+ * # Safety
+ * `hip_stream` is null or a valid hipStream_t for the active device.
+ */
+int32_t rl_gpu_wait_hip_stream(void *hip_stream);
+
+/**
+ * rl_gpu_wait_hip_stream(hip_stream) then rl_pm4_replay(ib).
+ * Lemon-mlx OWN_RMSNORM can use this as a single ordered entry point.
+ *
+ * # Safety
+ * Same as rl_pm4_replay for `ib`; `hip_stream` null or valid hipStream_t.
+ */
+int32_t rl_pm4_replay_after_hip_stream(struct RlPm4Ib *ib, void *hip_stream);
 
 #ifdef __cplusplus
 }  // extern "C"

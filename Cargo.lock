@@ -221,6 +221,7 @@ dependencies = [
 name = "redline-capi"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "radiowave",
  "redline-dispatch",
 ]

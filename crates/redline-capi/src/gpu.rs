@@ -36,9 +36,77 @@ use redline_dispatch::aql::{
 };
 
 use crate::{
-    RL_ERR_CERTIFICATION, RL_ERR_COMPILE, RL_ERR_HANDLE, RL_ERR_NULL, RL_ERR_RECORD, RL_ERR_REPLAY,
-    RL_ERR_UTF8, RL_OK,
+    RL_ERR_CERTIFICATION, RL_ERR_COMPILE, RL_ERR_HANDLE, RL_ERR_HIP, RL_ERR_NULL, RL_ERR_RECORD,
+    RL_ERR_REPLAY, RL_ERR_UTF8, RL_OK,
 };
+
+use std::sync::OnceLock;
+
+/// hipStreamSynchronize from libamdhip64 (dlopen; no hard link to HIP).
+type HipStreamSynchronizeFn = unsafe extern "C" fn(stream: *mut std::ffi::c_void) -> i32;
+
+fn hip_stream_synchronize_fn() -> Option<HipStreamSynchronizeFn> {
+    static CELL: OnceLock<Option<HipStreamSynchronizeFn>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        // SAFETY: loading the process HIP runtime; symbol is a well-known C API.
+        let lib = unsafe {
+            libloading::Library::new("libamdhip64.so")
+                .or_else(|_| libloading::Library::new("libamdhip64.so.7"))
+                .or_else(|_| libloading::Library::new("/opt/rocm/core/lib/libamdhip64.so"))
+        }
+        .ok()?;
+        // Leak the library for process lifetime (HIP must stay mapped).
+        let lib = Box::leak(Box::new(lib));
+        let sym: libloading::Symbol<HipStreamSynchronizeFn> =
+            unsafe { lib.get(b"hipStreamSynchronize\0") }.ok()?;
+        Some(*sym)
+    })
+}
+
+/// Wait until work previously submitted on `hip_stream` completes (host join).
+///
+/// **Phase 1 (this PR):** uses `hipStreamSynchronize` — same host cost as
+/// lemon-mlx `PRE_SYNC` today. **Phase 2 (future):** device-side wait packet
+/// so the host need not join. Returns `RL_OK`, `RL_ERR_NULL`, or `RL_ERR_HIP`.
+///
+/// # Safety
+/// `hip_stream` is null (no-op) or a valid `hipStream_t` for the current device.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rl_gpu_wait_hip_stream(hip_stream: *mut std::ffi::c_void) -> i32 {
+    if hip_stream.is_null() {
+        return RL_OK;
+    }
+    let Some(sync) = hip_stream_synchronize_fn() else {
+        return RL_ERR_HIP;
+    };
+    // hipSuccess == 0
+    let st = unsafe { sync(hip_stream) };
+    if st != 0 {
+        return RL_ERR_HIP;
+    }
+    RL_OK
+}
+
+/// Drain `hip_stream` (host join, phase 1) then [`rl_pm4_replay`].
+///
+/// Intended for dual-queue engines (e.g. MLX HIP producers + Redline RMSNorm):
+/// order Redline after product HIP without a separate ad-hoc Synchronize in the
+/// engine — one ABI call. Phase 1 does **not** remove host PRE tax; it
+/// centralizes it. Phase 2 will replace the host join with a GPU wait.
+///
+/// # Safety
+/// Same as [`rl_pm4_replay`] for `ib`; `hip_stream` null or valid `hipStream_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream(
+    ib: *mut RlPm4Ib,
+    hip_stream: *mut std::ffi::c_void,
+) -> i32 {
+    let wait = unsafe { rl_gpu_wait_hip_stream(hip_stream) };
+    if wait != RL_OK {
+        return wait;
+    }
+    unsafe { rl_pm4_replay(ib) }
+}
 
 /// A GPU binding: ROCr runtime + selected device + kernarg pool.
 pub struct RlGpu {
