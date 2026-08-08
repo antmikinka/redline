@@ -35,7 +35,8 @@ Host still joins producers via StreamSynchronize — same class of tax as lemon-
 1. ~~PM4 `WAIT_REG_MEM` prefix on HSA queue (no host poll)~~ **landed**  
 2. ~~Consumer fence + `hipStreamWaitValue32`~~ **landed** (`WRITE_DATA` + `rl_gpu_consumer_wait_hip_stream`)  
 3. ~~Host returns without `wait_signal`~~ **landed** (`rl_pm4_submit_after_hip_stream_phase2`)  
-4. lemon-mlx wire async path + short host microbench / B0–B1 (flags still opt-in; no ≥2% claim without measure)
+4. **Fix (20260808):** WAIT_REG_MEM `mem_space` is GFX9+ bits`[5:4]` (not SI-era bit 8). Wrong encoding hung CP 5s → OWN fail-open (no `phase2-used`).  
+5. lemon-mlx remeasure B1 phase2 for real `phase2-used` + honest t/s (flags still opt-in; no ≥2% claim without measure)
 
 ## When phase 2b (or any bridge work) is done — **commit + push required**
 

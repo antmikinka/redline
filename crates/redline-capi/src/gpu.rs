@@ -143,10 +143,22 @@ fn consumer_fence_addr() -> Option<u64> {
 }
 
 /// Build a tiny PM4 IB: WAIT_REG_MEM equal on device u32.
+///
+/// GFX9+ / MEC layout (PAL `PM4_MEC_WAIT_REG_MEM`):
+/// - ordinal2: function[2:0]=eq(3), mem_space[5:4]=memory(1), operation[7:6]=wait(0)
+/// - ordinal3: poll addr lo (DWORD-aligned; bits[1:0] reserved)
+/// - ordinal7: poll_interval[15:0] | optimize_ace_offload_mode[31] (MEC)
+///
+/// **Do not** use SI-era `mem_space << 8` — on gfx9–11 that leaves mem_space=0
+/// (register), so the CP hangs, host hits `DEFAULT_WAIT_TIMEOUT` (5s), the
+/// retained IB is inactivated, and OWN_RMSNORM fail-opens to product HIP
+/// (no `phase2-used` log). Measured 20260808-135237 on gfx1150.
 fn pm4_wait_reg_mem_eq(addr: u64, value: u32) -> Vec<u32> {
     const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
-    // equal(3) | memory space(1<<8)
-    let function = 3u32 | (1 << 8);
+    // function=equal(3) | mem_space=memory(1<<4). operation=wait_reg_mem(0).
+    let function = 3u32 | (1u32 << 4);
+    // poll_interval=4; bit31 = MEC optimize_ace_offload_mode (PAL sets this).
+    let poll = 4u32 | (1u32 << 31);
     vec![
         (3u32 << 30) | (5 << 16) | (PACKET3_WAIT_REG_MEM << 8),
         function,
@@ -154,7 +166,7 @@ fn pm4_wait_reg_mem_eq(addr: u64, value: u32) -> Vec<u32> {
         (addr >> 32) as u32,
         value,
         u32::MAX,
-        4, // poll interval
+        poll,
     ]
 }
 
@@ -1565,10 +1577,30 @@ pub unsafe extern "C" fn rl_pm4_ib_free(ib: *mut RlPm4Ib) {
 mod tests {
     use super::{
         Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, Pm4Commands, Pm4Family, QueuePolicy,
-        RL_ERR_NULL, RlQueuePolicy, rl_pm4_finalize_multi, rl_pm4_multi_ib_dispatch_count,
-        rl_pm4_multi_ib_free, rl_pm4_multi_ib_lane_count, rl_pm4_multi_ib_set_kernargs,
-        rl_pm4_replay_multi, rl_pm4_replay_multi_profiled,
+        RL_ERR_NULL, RlQueuePolicy, pm4_wait_reg_mem_eq, rl_pm4_finalize_multi,
+        rl_pm4_multi_ib_dispatch_count, rl_pm4_multi_ib_free, rl_pm4_multi_ib_lane_count,
+        rl_pm4_multi_ib_set_kernargs, rl_pm4_replay_multi, rl_pm4_replay_multi_profiled,
     };
+
+    #[test]
+    fn wait_reg_mem_eq_uses_gfx9_mem_space_bits() {
+        // PAL PM4_MEC_WAIT_REG_MEM: mem_space is bits[5:4], not SI-era bit 8.
+        let addr = 0x0000_7fcf_eee0_0000u64;
+        let dwords = pm4_wait_reg_mem_eq(addr, 0xAB_u32);
+        assert_eq!(dwords.len(), 7);
+        assert_eq!(dwords[0] >> 8 & 0xff, 0x3c); // opcode
+        assert_eq!(dwords[0] >> 16 & 0x3fff, 5); // COUNT = body_dwords - 1
+        assert_eq!(dwords[1] & 0x7, 3); // function = equal
+        assert_eq!((dwords[1] >> 4) & 0x3, 1); // mem_space = memory
+        assert_eq!((dwords[1] >> 6) & 0x3, 0); // operation = wait_reg_mem
+        assert_eq!(dwords[1] & (1 << 8), 0); // must NOT set SI-era bit 8 alone
+        assert_eq!(dwords[2], addr as u32);
+        assert_eq!(dwords[3], (addr >> 32) as u32);
+        assert_eq!(dwords[4], 0xAB);
+        assert_eq!(dwords[5], u32::MAX);
+        assert_eq!(dwords[6] & 0xffff, 4); // poll_interval
+        assert_ne!(dwords[6] & (1 << 31), 0); // MEC optimize_ace_offload_mode
+    }
 
     #[test]
     fn rdna_generations_select_their_pm4_family() {
