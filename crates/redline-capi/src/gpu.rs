@@ -92,10 +92,13 @@ const HIP_STREAM_WAIT_VALUE_GTE: u32 = 0x0;
 const HIP_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
 
 static PIPELINE_SEQ: AtomicU32 = AtomicU32::new(1);
-static PIPELINE_FENCE: OnceLock<u64> = OnceLock::new(); // device u32 prod fence address
+/// Last seq written by WRITE_DATA consumer fence (for hipStreamWaitValue32).
+static LAST_CONSUMER_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Device memory: [prod u32 @ +0][cons u32 @ +4].
+static PIPELINE_FENCE: OnceLock<u64> = OnceLock::new();
 
-/// Process-lifetime ROCr-executable WAIT_REG_MEM IB for phase 2b (device wait).
-struct Phase2bWaitIb {
+/// Process-lifetime ROCr-executable PM4 IB slot (WAIT_REG_MEM or WRITE_DATA).
+struct Phase2bPm4Ib {
     addr: *mut std::ffi::c_void,
     bytes: *mut u8,
     len: usize,
@@ -103,10 +106,18 @@ struct Phase2bWaitIb {
 }
 
 // SAFETY: rewritten under PHASE2B_LOCK; pointees are process-lifetime (forgotten).
-unsafe impl Send for Phase2bWaitIb {}
-unsafe impl Sync for Phase2bWaitIb {}
+unsafe impl Send for Phase2bPm4Ib {}
+unsafe impl Sync for Phase2bPm4Ib {}
 
-static PHASE2B_WAIT: OnceLock<Option<Phase2bWaitIb>> = OnceLock::new();
+/// Double-buffered wait + done IBs so async submit can return without holding
+/// the rewrite lock across GPU wait (next call uses the other slot).
+struct Phase2bPair {
+    wait: Phase2bPm4Ib,
+    done: Phase2bPm4Ib,
+}
+
+static PHASE2B_SLOTS: OnceLock<Option<[Phase2bPair; 2]>> = OnceLock::new();
+static PHASE2B_TURN: AtomicU32 = AtomicU32::new(0);
 static PHASE2B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn pipeline_fence_addr() -> Option<u64> {
@@ -117,7 +128,7 @@ fn pipeline_fence_addr() -> Option<u64> {
         if st != 0 || p.is_null() {
             return 0;
         }
-        // zero
+        // zero prod + cons
         let z = [0u8; 8];
         unsafe {
             (hip.memcpy)(p, z.as_ptr().cast(), 8, 1); // HostToDevice = 1
@@ -125,6 +136,10 @@ fn pipeline_fence_addr() -> Option<u64> {
         p as u64
     }))
     .filter(|a| *a != 0)
+}
+
+fn consumer_fence_addr() -> Option<u64> {
+    pipeline_fence_addr().map(|a| a + 4)
 }
 
 /// Build a tiny PM4 IB: WAIT_REG_MEM equal on device u32.
@@ -143,33 +158,92 @@ fn pm4_wait_reg_mem_eq(addr: u64, value: u32) -> Vec<u32> {
     ]
 }
 
-/// One-time ROCr executable IB used as WAIT_REG_MEM prefix (rewritten each call).
-fn phase2b_wait_ib() -> Option<&'static Phase2bWaitIb> {
-    PHASE2B_WAIT
+/// Build a tiny PM4 IB: WRITE_DATA of one u32 to device memory (consumer fence).
+///
+/// dst_sel=MEMORY (5), wr_confirm=1 — visible to hipStreamWaitValue32 after
+/// the retained kernel IB (AQL barrier order).
+fn pm4_write_data_u32(addr: u64, value: u32) -> Vec<u32> {
+    const PACKET3_WRITE_DATA: u32 = 0x37;
+    // dst_sel MEMORY (5<<8) | wr_confirm (1<<20)
+    let control = (5u32 << 8) | (1 << 20);
+    vec![
+        (3u32 << 30) | (3 << 16) | (PACKET3_WRITE_DATA << 8),
+        control,
+        addr as u32,
+        (addr >> 32) as u32,
+        value,
+    ]
+}
+
+fn alloc_phase2b_pm4_ib(pool: &KernargPool, dwords: &[u32]) -> Option<Phase2bPm4Ib> {
+    let byte_len = dwords.len() * 4;
+    let mut ib = pool.allocate_executable_bytes(byte_len).ok()?;
+    let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+    ib.write_exact(&bytes).ok()?;
+    let state = Phase2bPm4Ib {
+        addr: ib.address(),
+        bytes: ib.address().cast::<u8>(),
+        len: byte_len,
+        dwords: dwords.len() as u32,
+    };
+    std::mem::forget(ib);
+    Some(state)
+}
+
+/// Double-buffered WAIT_REG_MEM + WRITE_DATA IBs (process lifetime).
+fn phase2b_slots() -> Option<&'static [Phase2bPair; 2]> {
+    PHASE2B_SLOTS
         .get_or_init(|| {
             let runtime = Runtime::initialize(load_symbols().ok()?).ok()?;
             let device = runtime.select_gpu(GpuSelector::Ordinal(0)).ok()?;
             let pool = KernargPool::discover(&device).ok()?;
-            // Placeholder WAIT (addr/value patched per call before submit).
-            let dwords = pm4_wait_reg_mem_eq(0, 0);
-            let byte_len = dwords.len() * 4;
-            let mut ib = pool.allocate_executable_bytes(byte_len).ok()?;
-            let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
-            ib.write_exact(&bytes).ok()?;
-            let state = Phase2bWaitIb {
-                addr: ib.address(),
-                bytes: ib.address().cast::<u8>(),
-                len: byte_len,
-                dwords: dwords.len() as u32,
-            };
-            // Process-lifetime: keep GPU mapping; do not Drop free under feet.
-            std::mem::forget(ib);
+            let wait_dwords = pm4_wait_reg_mem_eq(0, 0);
+            let done_dwords = pm4_write_data_u32(0, 0);
+            let mut pairs = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let wait = alloc_phase2b_pm4_ib(&pool, &wait_dwords)?;
+                let done = alloc_phase2b_pm4_ib(&pool, &done_dwords)?;
+                pairs.push(Phase2bPair { wait, done });
+            }
+            let arr: [Phase2bPair; 2] = pairs.try_into().ok()?;
+            // Keep pool/device/runtime mappings process-lifetime.
             std::mem::forget(pool);
             std::mem::forget(device);
             std::mem::forget(runtime);
-            Some(state)
+            Some(arr)
         })
         .as_ref()
+}
+
+/// Next double-buffer slot (exclusive under PHASE2B_LOCK while rewritten).
+fn phase2b_take_slot() -> Option<&'static Phase2bPair> {
+    let slots = phase2b_slots()?;
+    let i = (PHASE2B_TURN.fetch_add(1, Ordering::Relaxed) & 1) as usize;
+    Some(&slots[i])
+}
+
+/// Patch executable IB body (caller holds PHASE2B_LOCK).
+unsafe fn rewrite_pm4_ib(ib: &Phase2bPm4Ib, dwords: &[u32]) -> bool {
+    let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+    if bytes.len() != ib.len {
+        return false;
+    }
+    // SAFETY: exclusive under lock; process-lifetime executable IB.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ib.bytes, ib.len);
+    }
+    true
+}
+
+fn next_pipeline_seq() -> u32 {
+    let seq = PIPELINE_SEQ.fetch_add(1, Ordering::Relaxed);
+    if seq == 0 {
+        // skip 0 so eq never matches cleared memory accidentally
+        PIPELINE_SEQ.store(1, Ordering::Relaxed);
+        1
+    } else {
+        seq
+    }
 }
 
 /// Emergency host DtoH poll (known slower). Only if REDLINE_PHASE2_HOST_POLL=1.
@@ -278,14 +352,7 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
     let Some(ib_ref) = (unsafe { ib.as_mut() }) else {
         return RL_ERR_NULL;
     };
-    let seq = PIPELINE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let seq = if seq == 0 {
-        // skip 0 so eq never matches cleared memory accidentally
-        PIPELINE_SEQ.store(1, Ordering::Relaxed);
-        1
-    } else {
-        seq
-    };
+    let seq = next_pipeline_seq();
 
     // Milestone after all prior work on the product stream.
     let st = unsafe {
@@ -296,31 +363,28 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
     }
 
     // Phase 2b: device-side WAIT_REG_MEM prefix then retained replay.
-    if let Some(wait) = phase2b_wait_ib() {
+    // Hold lock only across rewrite+submit; wait under lock for the *sync*
+    // path so a concurrent rewrite cannot clobber the in-flight single slot
+    // (async path uses double-buffer + returns before wait).
+    if let Some(slot) = phase2b_take_slot() {
         let dwords = pm4_wait_reg_mem_eq(fence, seq);
-        let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
-        if bytes.len() == wait.len {
-            // Hold lock across rewrite + submit + wait so IB is not clobbered mid-flight.
-            let _guard = match PHASE2B_LOCK.lock() {
-                Ok(g) => g,
-                Err(_) => return unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) },
-            };
-            // SAFETY: exclusive under lock; process-lifetime executable IB.
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), wait.bytes, wait.len);
-            }
+        let _guard = match PHASE2B_LOCK.lock() {
+            Ok(g) => g,
+            Err(_) => return unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) },
+        };
+        if unsafe { rewrite_pm4_ib(&slot.wait, &dwords) } {
             match unsafe {
                 ib_ref
                     .ib
-                    .replay_and_wait_with_pm4_ib_prefix(wait.addr, wait.dwords)
+                    .replay_and_wait_with_pm4_ib_prefix(slot.wait.addr, slot.wait.dwords)
             } {
                 Ok(()) => return RL_OK,
                 Err(_) => {
                     // Fall through to host poll / phase1 after dropping lock.
                 }
             }
-            drop(_guard);
         }
+        drop(_guard);
     }
 
     // Opt-in host poll only (measured slower than phase1 — not default).
@@ -339,9 +403,125 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
     unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) }
 }
 
+/// Phase 2b **async**: WriteValue milestone + WAIT_REG_MEM prefix + retained
+/// submit + WRITE_DATA consumer fence; **no** host `wait_signal`.
+///
+/// Host may return immediately. Product HIP consumers should call
+/// [`rl_gpu_consumer_wait_hip_stream`] (hipStreamWaitValue32). Caller **must**
+/// [`rl_pm4_wait`] before reusing the same IB for `set_kernargs` / next submit.
+///
+/// Falls back to [`rl_pm4_replay_after_hip_stream_phase2`] (host wait) on error.
+///
+/// # Safety
+/// Same as [`rl_pm4_replay_after_hip_stream_phase2`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rl_pm4_submit_after_hip_stream_phase2(
+    ib: *mut RlPm4Ib,
+    hip_stream: *mut std::ffi::c_void,
+) -> i32 {
+    if hip_stream.is_null() {
+        return unsafe { rl_pm4_submit(ib) };
+    }
+    let Some(hip) = hip_fns() else {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    };
+    let Some(prod) = pipeline_fence_addr() else {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    };
+    let Some(cons) = consumer_fence_addr() else {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    };
+    let Some(ib_ref) = (unsafe { ib.as_mut() }) else {
+        return RL_ERR_NULL;
+    };
+    let Some(slot) = phase2b_take_slot() else {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    };
+    let seq = next_pipeline_seq();
+
+    let st = unsafe {
+        (hip.stream_write_value32)(hip_stream, prod as *mut std::ffi::c_void, seq, 0)
+    };
+    if st != 0 {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    }
+
+    let wait_dw = pm4_wait_reg_mem_eq(prod, seq);
+    let done_dw = pm4_write_data_u32(cons, seq);
+    let _guard = match PHASE2B_LOCK.lock() {
+        Ok(g) => g,
+        Err(_) => return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) },
+    };
+    if !unsafe { rewrite_pm4_ib(&slot.wait, &wait_dw) }
+        || !unsafe { rewrite_pm4_ib(&slot.done, &done_dw) }
+    {
+        drop(_guard);
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    }
+    match unsafe {
+        ib_ref.ib.submit_with_pm4_ib_prefix_suffix(
+            slot.wait.addr,
+            slot.wait.dwords,
+            slot.done.addr,
+            slot.done.dwords,
+        )
+    } {
+        Ok(()) => {
+            // Seq the product stream should WaitValue32 for (WRITE_DATA after kernel).
+            LAST_CONSUMER_SEQ.store(seq, Ordering::Release);
+            RL_OK
+        }
+        Err(_) => {
+            drop(_guard);
+            unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) }
+        }
+    }
+}
+
+/// Enqueue `hipStreamWaitValue32` (eq) on the last phase2b consumer fence so
+/// product HIP work waits for Redline kernel + WRITE_DATA without host join.
+///
+/// Pair after [`rl_pm4_submit_after_hip_stream_phase2`]. No-op success if no
+/// consumer seq has been published yet.
+///
+/// # Safety
+/// `hip_stream` null or valid `hipStream_t` for the active device.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rl_gpu_consumer_wait_hip_stream(
+    hip_stream: *mut std::ffi::c_void,
+) -> i32 {
+    if hip_stream.is_null() {
+        return RL_OK;
+    }
+    let seq = LAST_CONSUMER_SEQ.load(Ordering::Acquire);
+    if seq == 0 {
+        return RL_OK;
+    }
+    let Some(hip) = hip_fns() else {
+        return RL_ERR_HIP;
+    };
+    let Some(cons) = consumer_fence_addr() else {
+        return RL_ERR_HIP;
+    };
+    let st = unsafe {
+        (hip.stream_wait_value32)(
+            hip_stream,
+            cons as *mut std::ffi::c_void,
+            seq,
+            HIP_STREAM_WAIT_VALUE_EQ,
+            0,
+        )
+    };
+    if st != 0 {
+        return RL_ERR_HIP;
+    }
+    RL_OK
+}
+
 /// Phase 2 async: submit retained IB without host wait. Pair with [`rl_pm4_wait`].
 ///
 /// Does **not** establish HIP producer ordering by itself — use
+/// [`rl_pm4_submit_after_hip_stream_phase2`] or
 /// [`rl_pm4_replay_after_hip_stream_phase2`] for ordered OWN_RMSNORM.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rl_pm4_submit(ib: *mut RlPm4Ib) -> i32 {

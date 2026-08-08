@@ -650,8 +650,23 @@ int32_t rl_pm4_replay_after_hip_stream(struct RlPm4Ib *ib, void *hip_stream);
  * Phase 2b: hipStreamWriteValue32 milestone + PM4 WAIT_REG_MEM prefix on the
  * HSA queue (device wait, no host StreamSynchronize). Falls back to phase 1 on
  * error. Host DtoH poll only if REDLINE_PHASE2_HOST_POLL=1 (known slower).
+ * Host still waits on Redline completion (safe for IB reuse / set_kernargs).
  */
 int32_t rl_pm4_replay_after_hip_stream_phase2(struct RlPm4Ib *ib, void *hip_stream);
+
+/**
+ * Phase 2b async: WriteValue + WAIT_REG_MEM + submit + WRITE_DATA consumer fence.
+ * Returns after doorbell (no host wait_signal). Pair with
+ * rl_gpu_consumer_wait_hip_stream for product HIP ordering, and rl_pm4_wait
+ * before reusing the same IB. Falls back to replay_after_hip_stream_phase2.
+ */
+int32_t rl_pm4_submit_after_hip_stream_phase2(struct RlPm4Ib *ib, void *hip_stream);
+
+/**
+ * Enqueue hipStreamWaitValue32(eq) on the last phase2b consumer fence so the
+ * product stream waits for Redline kernel + WRITE_DATA without host join.
+ */
+int32_t rl_gpu_consumer_wait_hip_stream(void *hip_stream);
 
 /** Submit retained IB without waiting (pair with rl_pm4_wait). */
 int32_t rl_pm4_submit(struct RlPm4Ib *ib);

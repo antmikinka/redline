@@ -426,19 +426,65 @@ impl SingleQueuePm4Ib {
         unsafe { self.submit_with_prefix(std::slice::from_ref(&prefix)) }
     }
 
+    /// Phase 2b async + consumer fence: WAIT_REG_MEM prefix, retained IB, then
+    /// WRITE_DATA (or similar) suffix. Host returns after doorbell.
+    ///
+    /// Queue barrier bits keep order: wait → kernel → consumer memory write.
+    /// Completion signal remains on the retained kernel packet (for
+    /// [`Self::wait_only`] before IB reuse / set_kernargs).
+    ///
+    /// # Safety
+    /// Prefix/suffix GPU-executable IBs and retained pointees stay live through
+    /// consumer wait / [`Self::wait_only`].
+    pub unsafe fn submit_with_pm4_ib_prefix_suffix(
+        &mut self,
+        prefix_addr: *mut std::ffi::c_void,
+        prefix_dwords: u32,
+        suffix_addr: *mut std::ffi::c_void,
+        suffix_dwords: u32,
+    ) -> Result<(), ReplayError> {
+        let prefix = PacketImage::pm4_indirect_buffer(
+            prefix_addr,
+            prefix_dwords,
+            abi::Signal(0),
+        )?;
+        let suffix = PacketImage::pm4_indirect_buffer(
+            suffix_addr,
+            suffix_dwords,
+            abi::Signal(0),
+        )?;
+        // SAFETY: caller keeps affix IBs live through wait/consumer fence.
+        unsafe { self.submit_with_prefix_suffix(&[prefix], &[suffix]) }
+    }
+
     /// Submit prefix + retained IB without host wait (phase-2 async).
     ///
     /// # Safety
     /// Same as [`Self::replay_and_wait_with_prefix`]; caller must [`Self::wait_only`]
     /// or establish a GPU-side consumer wait before freeing pointees.
     pub unsafe fn submit_with_prefix(&mut self, prefix: &[PacketImage]) -> Result<(), ReplayError> {
+        // SAFETY: forwarded; no suffix.
+        unsafe { self.submit_with_prefix_suffix(prefix, &[]) }
+    }
+
+    /// Submit prefix + retained IB + suffix without host wait.
+    ///
+    /// # Safety
+    /// Same as [`Self::submit_with_prefix`]; affix pointees live through wait.
+    pub unsafe fn submit_with_prefix_suffix(
+        &mut self,
+        prefix: &[PacketImage],
+        suffix: &[PacketImage],
+    ) -> Result<(), ReplayError> {
         if !self.usable {
             return Err(ReplayError::GraphInactive);
         }
         self.completion.reset();
-        let mut batch = Vec::with_capacity(prefix.len() + self.batch.len());
+        let mut batch =
+            Vec::with_capacity(prefix.len() + self.batch.len() + suffix.len());
         batch.extend_from_slice(prefix);
         batch.extend_from_slice(&self.batch);
+        batch.extend_from_slice(suffix);
         if let Err(error) = self.queues.prepare_batches(std::slice::from_ref(&batch)) {
             self.usable = false;
             return Err(error.into());
