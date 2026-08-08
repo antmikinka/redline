@@ -41,7 +41,7 @@ use crate::{
 };
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// HIP runtime symbols via dlopen (no hard link).
 struct HipFns {
@@ -100,8 +100,12 @@ const HIP_STREAM_WAIT_VALUE_MASK_ALL: u32 = 0xffff_ffff;
 const HIP_MALLOC_SIGNAL_MEMORY: u32 = 0x2;
 
 static PIPELINE_SEQ: AtomicU32 = AtomicU32::new(1);
-/// Last seq written by WRITE_DATA consumer fence (for hipStreamWaitValue32).
+/// Legacy WRITE_DATA consumer fence seq (kept for diagnostics).
 static LAST_CONSUMER_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Path B consumer wait: device pointer for hipStreamWaitValue32 (0 = none).
+static LAST_CONSUMER_ADDR: AtomicU64 = AtomicU64::new(0);
+/// Expected value at LAST_CONSUMER_ADDR (completion signal → 0).
+static LAST_CONSUMER_VALUE: AtomicU32 = AtomicU32::new(0);
 /// Device memory: [prod u32 @ +0][cons u32 @ +4].
 static PIPELINE_FENCE: OnceLock<u64> = OnceLock::new();
 
@@ -162,6 +166,39 @@ fn pipeline_fence_addr() -> Option<u64> {
 
 fn consumer_fence_addr() -> Option<u64> {
     pipeline_fence_addr().map(|a| a + 4)
+}
+
+/// `hsa_amd_signal_value_pointer` — GPU-visible location of an HSA signal value.
+///
+/// Path B prefers WaitValue on the retained IB completion signal (1→0) over
+/// PM4 WRITE_DATA into hipMallocSignalMemory, which hung on gfx1150.
+fn hsa_signal_value_pointer(signal_handle: u64) -> Option<*mut i64> {
+    type FnPtr = unsafe extern "C" fn(u64, *mut *mut i64) -> u32;
+    static CELL: OnceLock<Option<FnPtr>> = OnceLock::new();
+    let f = CELL.get_or_init(|| {
+        let lib = unsafe {
+            libloading::Library::new("libhsa-runtime64.so")
+                .or_else(|_| libloading::Library::new("libhsa-runtime64.so.1"))
+                .or_else(|_| {
+                    libloading::Library::new("/opt/rocm/core/lib/libhsa-runtime64.so")
+                })
+        }
+        .ok()?;
+        let lib = Box::leak(Box::new(lib));
+        unsafe { lib.get(b"hsa_amd_signal_value_pointer\0").ok().map(|s| *s) }
+    })
+    .as_ref()?;
+    let mut p: *mut i64 = std::ptr::null_mut();
+    let st = unsafe { f(signal_handle, &mut p) };
+    if st != 0 || p.is_null() {
+        return None;
+    }
+    Some(p)
+}
+
+fn publish_consumer_wait(addr: u64, value: u32) {
+    LAST_CONSUMER_ADDR.store(addr, Ordering::Release);
+    LAST_CONSUMER_VALUE.store(value, Ordering::Release);
 }
 
 /// Build a tiny PM4 IB: WAIT_REG_MEM equal on device u32.
@@ -438,11 +475,15 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
 }
 
 /// Phase 2b **async**: WriteValue milestone + WAIT_REG_MEM prefix + retained
-/// submit + WRITE_DATA consumer fence; **no** host `wait_signal`.
+/// submit; **no** host `wait_signal`.
 ///
-/// Host may return immediately. Product HIP consumers should call
-/// [`rl_gpu_consumer_wait_hip_stream`] (hipStreamWaitValue32). Caller **must**
-/// [`rl_pm4_wait`] before reusing the same IB for `set_kernargs` / next submit.
+/// **Consumer fence (Path B, gfx1150):** publish the retained IB's HSA
+/// completion signal value pointer for [`rl_gpu_consumer_wait_hip_stream`]
+/// (`hipStreamWaitValue32` until value **0**). This replaces PM4 `WRITE_DATA`
+/// into a hip fence, which hung WaitValue on gfx1150 even with signal memory.
+///
+/// Host may return immediately. Caller **must** [`rl_pm4_wait`] before reusing
+/// the same IB for `set_kernargs` / next submit.
 ///
 /// Falls back to [`rl_pm4_replay_after_hip_stream_phase2`] (host wait) on error.
 ///
@@ -462,13 +503,15 @@ pub unsafe extern "C" fn rl_pm4_submit_after_hip_stream_phase2(
     let Some(prod) = pipeline_fence_addr() else {
         return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
     };
-    let Some(cons) = consumer_fence_addr() else {
-        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
-    };
     let Some(ib_ref) = (unsafe { ib.as_mut() }) else {
         return RL_ERR_NULL;
     };
     let Some(slot) = phase2b_take_slot() else {
+        return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
+    };
+    // Prefer HSA completion signal pointer (WaitValue on 1→0). Required for
+    // real Path B without host join; fall back to sync phase2 if missing.
+    let Some(sig_ptr) = hsa_signal_value_pointer(ib_ref.ib.completion_signal_handle()) else {
         return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
     };
     let seq = next_pipeline_seq();
@@ -481,27 +524,24 @@ pub unsafe extern "C" fn rl_pm4_submit_after_hip_stream_phase2(
     }
 
     let wait_dw = pm4_wait_reg_mem_eq(prod, seq);
-    let done_dw = pm4_write_data_u32(cons, seq);
     let _guard = match PHASE2B_LOCK.lock() {
         Ok(g) => g,
         Err(_) => return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) },
     };
-    if !unsafe { rewrite_pm4_ib(&slot.wait, &wait_dw) }
-        || !unsafe { rewrite_pm4_ib(&slot.done, &done_dw) }
-    {
+    if !unsafe { rewrite_pm4_ib(&slot.wait, &wait_dw) } {
         drop(_guard);
         return unsafe { rl_pm4_replay_after_hip_stream_phase2(ib, hip_stream) };
     }
+    // Prefix WAIT only — consumer fence is the AQL completion signal (no WRITE_DATA).
     match unsafe {
-        ib_ref.ib.submit_with_pm4_ib_prefix_suffix(
-            slot.wait.addr,
-            slot.wait.dwords,
-            slot.done.addr,
-            slot.done.dwords,
-        )
+        ib_ref
+            .ib
+            .submit_with_pm4_ib_prefix(slot.wait.addr, slot.wait.dwords)
     } {
         Ok(()) => {
-            // Seq the product stream should WaitValue32 for (WRITE_DATA after kernel).
+            // Completion signal starts at 1; hardware stores 0 when packet done.
+            // WaitValue32 on low 32 bits of the signal value (0 / 1 fit u32).
+            publish_consumer_wait(sig_ptr as u64, 0);
             LAST_CONSUMER_SEQ.store(seq, Ordering::Release);
             RL_OK
         }
@@ -512,11 +552,11 @@ pub unsafe extern "C" fn rl_pm4_submit_after_hip_stream_phase2(
     }
 }
 
-/// Enqueue `hipStreamWaitValue32` (eq) on the last phase2b consumer fence so
-/// product HIP work waits for Redline kernel + WRITE_DATA without host join.
+/// Enqueue `hipStreamWaitValue32` (eq) so product HIP work waits for the last
+/// Path B Redline submit to complete (HSA completion signal value → 0).
 ///
-/// Pair after [`rl_pm4_submit_after_hip_stream_phase2`]. No-op success if no
-/// consumer seq has been published yet.
+/// Pair after [`rl_pm4_submit_after_hip_stream_phase2`]. No-op if no consumer
+/// address has been published yet.
 ///
 /// # Safety
 /// `hip_stream` null or valid `hipStream_t` for the active device.
@@ -527,21 +567,19 @@ pub unsafe extern "C" fn rl_gpu_consumer_wait_hip_stream(
     if hip_stream.is_null() {
         return RL_OK;
     }
-    let seq = LAST_CONSUMER_SEQ.load(Ordering::Acquire);
-    if seq == 0 {
+    let addr = LAST_CONSUMER_ADDR.load(Ordering::Acquire);
+    if addr == 0 {
         return RL_OK;
     }
+    let value = LAST_CONSUMER_VALUE.load(Ordering::Acquire);
     let Some(hip) = hip_fns() else {
-        return RL_ERR_HIP;
-    };
-    let Some(cons) = consumer_fence_addr() else {
         return RL_ERR_HIP;
     };
     let st = unsafe {
         (hip.stream_wait_value32)(
             hip_stream,
-            cons as *mut std::ffi::c_void,
-            seq,
+            addr as *mut std::ffi::c_void,
+            value,
             HIP_STREAM_WAIT_VALUE_EQ,
             HIP_STREAM_WAIT_VALUE_MASK_ALL,
         )

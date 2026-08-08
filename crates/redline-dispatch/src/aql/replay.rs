@@ -294,6 +294,14 @@ impl SingleQueuePm4Ib {
         self.indirect.address() as usize
     }
 
+    /// AQL completion signal handle for the retained IB (`hsa_signal_t` bits).
+    /// Starts at 1 on submit/reset; hardware publishes 0 when the packet completes.
+    ///
+    /// Path B: `hsa_amd_signal_value_pointer` + `hipStreamWaitValue32(..., 0, EQ)`.
+    pub fn completion_signal_handle(&self) -> u64 {
+        self.completion.raw().0
+    }
+
     /// Submit and synchronously prove completion with a finite timeout.
     ///
     /// # Safety
