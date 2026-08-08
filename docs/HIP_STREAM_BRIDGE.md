@@ -34,6 +34,22 @@ Host still joins producers via StreamSynchronize — same class of tax as lemon-
 2. Consumer fence + `hipStreamWaitValue32` on product stream  
 3. Host returns without `wait_signal` (async OWN_RMSNORM via submit/wait)
 
+## When phase 2b (or any bridge work) is done — **commit + push required**
+
+Remote is **your fork** (not warpfront):
+
+```bash
+cd /home/antmi/redline
+git remote -v   # origin MUST be https://github.com/antmikinka/redline.git
+git checkout exp/hip-stream-bridge
+git add <paths>
+git commit -m "feat(capi): <what landed>"
+git push origin exp/hip-stream-bridge
+# never --force
+```
+
+If lemon-mlx wire changed, also commit+push `exp/redline-kernel-launch` on lemonade-sdk/lemon-mlx-engine.
+
 ## Build / install
 
 ```bash
