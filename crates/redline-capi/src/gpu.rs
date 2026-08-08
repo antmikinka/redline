@@ -94,6 +94,21 @@ const HIP_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
 static PIPELINE_SEQ: AtomicU32 = AtomicU32::new(1);
 static PIPELINE_FENCE: OnceLock<u64> = OnceLock::new(); // device u32 prod fence address
 
+/// Process-lifetime ROCr-executable WAIT_REG_MEM IB for phase 2b (device wait).
+struct Phase2bWaitIb {
+    addr: *mut std::ffi::c_void,
+    bytes: *mut u8,
+    len: usize,
+    dwords: u32,
+}
+
+// SAFETY: rewritten under PHASE2B_LOCK; pointees are process-lifetime (forgotten).
+unsafe impl Send for Phase2bWaitIb {}
+unsafe impl Sync for Phase2bWaitIb {}
+
+static PHASE2B_WAIT: OnceLock<Option<Phase2bWaitIb>> = OnceLock::new();
+static PHASE2B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pipeline_fence_addr() -> Option<u64> {
     let hip = hip_fns()?;
     Some(*PIPELINE_FENCE.get_or_init(|| {
@@ -126,6 +141,69 @@ fn pm4_wait_reg_mem_eq(addr: u64, value: u32) -> Vec<u32> {
         u32::MAX,
         4, // poll interval
     ]
+}
+
+/// One-time ROCr executable IB used as WAIT_REG_MEM prefix (rewritten each call).
+fn phase2b_wait_ib() -> Option<&'static Phase2bWaitIb> {
+    PHASE2B_WAIT
+        .get_or_init(|| {
+            let runtime = Runtime::initialize(load_symbols().ok()?).ok()?;
+            let device = runtime.select_gpu(GpuSelector::Ordinal(0)).ok()?;
+            let pool = KernargPool::discover(&device).ok()?;
+            // Placeholder WAIT (addr/value patched per call before submit).
+            let dwords = pm4_wait_reg_mem_eq(0, 0);
+            let byte_len = dwords.len() * 4;
+            let mut ib = pool.allocate_executable_bytes(byte_len).ok()?;
+            let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+            ib.write_exact(&bytes).ok()?;
+            let state = Phase2bWaitIb {
+                addr: ib.address(),
+                bytes: ib.address().cast::<u8>(),
+                len: byte_len,
+                dwords: dwords.len() as u32,
+            };
+            // Process-lifetime: keep GPU mapping; do not Drop free under feet.
+            std::mem::forget(ib);
+            std::mem::forget(pool);
+            std::mem::forget(device);
+            std::mem::forget(runtime);
+            Some(state)
+        })
+        .as_ref()
+}
+
+/// Emergency host DtoH poll (known slower). Only if REDLINE_PHASE2_HOST_POLL=1.
+fn phase2_host_poll_enabled() -> bool {
+    match std::env::var("REDLINE_PHASE2_HOST_POLL") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
+        Err(_) => false,
+    }
+}
+
+fn phase2_host_poll_fence(hip: &HipFns, fence: u64, seq: u32) -> i32 {
+    let mut spins = 0u32;
+    loop {
+        let mut host_val = 0u32;
+        let rc = unsafe {
+            (hip.memcpy)(
+                (&mut host_val as *mut u32).cast(),
+                fence as *const std::ffi::c_void,
+                4,
+                HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        if rc != 0 {
+            return RL_ERR_HIP;
+        }
+        if host_val == seq {
+            return RL_OK;
+        }
+        spins = spins.wrapping_add(1);
+        if spins > 100_000_000 {
+            return RL_ERR_HIP;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// Wait until work previously submitted on `hip_stream` completes (host join).
@@ -165,19 +243,21 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream(
     unsafe { rl_pm4_replay(ib) }
 }
 
-/// Phase 2: order Redline after HIP producers **without** host `hipStreamSynchronize`.
+/// Phase 2 / 2b: order Redline after HIP producers **without** host
+/// `hipStreamSynchronize`.
 ///
-/// Protocol:
+/// **Phase 2b (default when ROCr wait IB is available):**
 /// 1. `hipStreamWriteValue32(stream, fence, seq)` — GPU milestone after producers
-/// 2. Submit retained IB prefixed with PM4 `WAIT_REG_MEM` (equal) on `fence`
-/// 3. Host waits only for Redline completion signal (covers wait+kernel)
+/// 2. PM4 `WAIT_REG_MEM` (equal) prefix on the HSA queue for that fence/seq
+/// 3. retained IB submit + host wait on Redline completion only
 ///
-/// Host is **not** blocked in HIP synchronize while producers run; the HSA queue
-/// waits on the memory fence. Wall-clock of the call still includes producer
-/// tail once WAIT unblocks (same GPU critical path) but enables earlier doorbell
-/// and removes HIP driver join cost.
+/// Host is **not** spinning on DtoH and **not** in HIP StreamSynchronize while
+/// producers run; the CP waits on device memory. Call wall-time still includes
+/// producer tail once WAIT unblocks (GPU critical path) but removes host join tax.
 ///
-/// If phase-2 symbols/alloc fail, falls back to phase 1.
+/// **Fallback order:** phase2b → (opt-in) host DtoH poll if
+/// `REDLINE_PHASE2_HOST_POLL=1` → phase1 StreamSynchronize. Host poll is known
+/// slower and must not be product default.
 ///
 /// # Safety
 /// Same as [`rl_pm4_replay_after_hip_stream`].
@@ -199,11 +279,13 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
         return RL_ERR_NULL;
     };
     let seq = PIPELINE_SEQ.fetch_add(1, Ordering::Relaxed);
-    if seq == 0 {
-        // skip 0 so WaitValue/eq never matches cleared memory accidentally
+    let seq = if seq == 0 {
+        // skip 0 so eq never matches cleared memory accidentally
         PIPELINE_SEQ.store(1, Ordering::Relaxed);
-    }
-    let seq = if seq == 0 { 1 } else { seq };
+        1
+    } else {
+        seq
+    };
 
     // Milestone after all prior work on the product stream.
     let st = unsafe {
@@ -213,53 +295,54 @@ pub unsafe extern "C" fn rl_pm4_replay_after_hip_stream_phase2(
         return unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) };
     }
 
-    // Build WAIT_REG_MEM PM4 IB on the device (executable).
-    let dwords = pm4_wait_reg_mem_eq(fence, seq);
-    let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
-    // Allocate executable buffer via the IB's device — use kernarg pool from module path.
-    // RlPm4Ib does not expose GpuDevice; allocate via hipMalloc for PM4 IB bytes and
-    // mark... HIP malloc is not executable for PM4 on all paths. Use ROCr pool instead.
-    // Fall back to phase1 if we cannot build prefix packet without device pool.
-    //
-    // Practical phase2 without ROCr pool on C ABI: host-poll the fence with DtoH
-    // until seq matches, then replay — still host wait but after WriteValue (same
-    // critical path, avoids StreamSynchronize path differences).
-    let mut spins = 0u32;
-    loop {
-        let mut host_val = 0u32;
-        let rc = unsafe {
-            (hip.memcpy)(
-                (&mut host_val as *mut u32).cast(),
-                fence as *const std::ffi::c_void,
-                4,
-                HIP_MEMCPY_DEVICE_TO_HOST,
-            )
-        };
-        if rc != 0 {
+    // Phase 2b: device-side WAIT_REG_MEM prefix then retained replay.
+    if let Some(wait) = phase2b_wait_ib() {
+        let dwords = pm4_wait_reg_mem_eq(fence, seq);
+        let bytes: Vec<u8> = dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+        if bytes.len() == wait.len {
+            // Hold lock across rewrite + submit + wait so IB is not clobbered mid-flight.
+            let _guard = match PHASE2B_LOCK.lock() {
+                Ok(g) => g,
+                Err(_) => return unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) },
+            };
+            // SAFETY: exclusive under lock; process-lifetime executable IB.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), wait.bytes, wait.len);
+            }
+            match unsafe {
+                ib_ref
+                    .ib
+                    .replay_and_wait_with_pm4_ib_prefix(wait.addr, wait.dwords)
+            } {
+                Ok(()) => return RL_OK,
+                Err(_) => {
+                    // Fall through to host poll / phase1 after dropping lock.
+                }
+            }
+            drop(_guard);
+        }
+    }
+
+    // Opt-in host poll only (measured slower than phase1 — not default).
+    if phase2_host_poll_enabled() {
+        let poll = phase2_host_poll_fence(hip, fence, seq);
+        if poll != RL_OK {
             return unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) };
         }
-        if host_val == seq {
-            break;
-        }
-        spins = spins.wrapping_add(1);
-        if spins > 100_000_000 {
-            return RL_ERR_HIP;
-        }
-        std::thread::yield_now();
+        return match unsafe { ib_ref.ib.replay_and_wait() } {
+            Ok(()) => RL_OK,
+            Err(_) => RL_ERR_REPLAY,
+        };
     }
-    let _ = bytes; // WAIT_REG_MEM IB reserved for next iteration with ROCr pool
-    match unsafe { ib_ref.ib.replay_and_wait() } {
-        Ok(()) => RL_OK,
-        Err(_) => RL_ERR_REPLAY,
-    }
+
+    // Default fallback: phase1 host StreamSynchronize + replay.
+    unsafe { rl_pm4_replay_after_hip_stream(ib, hip_stream) }
 }
 
-/// Phase 2 async: WriteValue milestone, WAIT via host poll, **submit** IB without
-/// host wait; then `hipStreamWaitValue32` is **not** used (cons fence needs PM4
-/// write). Caller must [`rl_pm4_wait`] before freeing pointees unless using
-/// phase-1 semantics.
+/// Phase 2 async: submit retained IB without host wait. Pair with [`rl_pm4_wait`].
 ///
-/// For lemon-mlx v1 we expose submit/wait split:
+/// Does **not** establish HIP producer ordering by itself — use
+/// [`rl_pm4_replay_after_hip_stream_phase2`] for ordered OWN_RMSNORM.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rl_pm4_submit(ib: *mut RlPm4Ib) -> i32 {
     let Some(ib) = (unsafe { ib.as_mut() }) else {

@@ -647,8 +647,9 @@ int32_t rl_gpu_wait_hip_stream(void *hip_stream);
 int32_t rl_pm4_replay_after_hip_stream(struct RlPm4Ib *ib, void *hip_stream);
 
 /**
- * Phase 2: hipStreamWriteValue32 milestone on stream, host-poll fence (no
- * hipStreamSynchronize), then rl_pm4_replay. Falls back to phase 1 on error.
+ * Phase 2b: hipStreamWriteValue32 milestone + PM4 WAIT_REG_MEM prefix on the
+ * HSA queue (device wait, no host StreamSynchronize). Falls back to phase 1 on
+ * error. Host DtoH poll only if REDLINE_PHASE2_HOST_POLL=1 (known slower).
  */
 int32_t rl_pm4_replay_after_hip_stream_phase2(struct RlPm4Ib *ib, void *hip_stream);
 

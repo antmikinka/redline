@@ -384,6 +384,48 @@ impl SingleQueuePm4Ib {
         unsafe { self.wait_inner() }
     }
 
+    /// Phase 2b: submit one PM4 indirect buffer (e.g. WAIT_REG_MEM) then this
+    /// retained IB on the same HSA queue, and wait for the retained completion.
+    ///
+    /// The prefix packet uses a null completion signal; ordering relies on the
+    /// queue barrier bit of the vendor PM4-IB AQL packet plus this IB's signal.
+    ///
+    /// # Safety
+    /// `prefix_addr` must point at a GPU-executable PM4 IB of `prefix_dwords`
+    /// dwords that remains live through the wait, along with this IB's pointees.
+    pub unsafe fn replay_and_wait_with_pm4_ib_prefix(
+        &mut self,
+        prefix_addr: *mut std::ffi::c_void,
+        prefix_dwords: u32,
+    ) -> Result<(), ReplayError> {
+        let prefix = PacketImage::pm4_indirect_buffer(
+            prefix_addr,
+            prefix_dwords,
+            abi::Signal(0),
+        )?;
+        // SAFETY: caller keeps prefix IB and retained pointees live through wait.
+        unsafe { self.replay_and_wait_with_prefix(std::slice::from_ref(&prefix)) }
+    }
+
+    /// Phase 2b async: same as [`Self::replay_and_wait_with_pm4_ib_prefix`] but
+    /// returns after doorbell (caller must [`Self::wait_only`]).
+    ///
+    /// # Safety
+    /// Same as [`Self::replay_and_wait_with_pm4_ib_prefix`]; pointees live until wait.
+    pub unsafe fn submit_with_pm4_ib_prefix(
+        &mut self,
+        prefix_addr: *mut std::ffi::c_void,
+        prefix_dwords: u32,
+    ) -> Result<(), ReplayError> {
+        let prefix = PacketImage::pm4_indirect_buffer(
+            prefix_addr,
+            prefix_dwords,
+            abi::Signal(0),
+        )?;
+        // SAFETY: caller keeps prefix IB live through wait_only / consumer fence.
+        unsafe { self.submit_with_prefix(std::slice::from_ref(&prefix)) }
+    }
+
     /// Submit prefix + retained IB without host wait (phase-2 async).
     ///
     /// # Safety

@@ -32,7 +32,7 @@ pub const RL_ERR_HIP: i32 = -8;
 
 /// Feature bit: phase-1 host `hipStreamSynchronize` then replay.
 pub const RL_FEATURE_HIP_STREAM_WAIT: u32 = 0x1;
-/// Feature bit: phase-2 WriteValue + WAIT_REG_MEM + optional async consumer WaitValue.
+/// Feature bit: phase-2b WriteValue + PM4 WAIT_REG_MEM prefix (device wait).
 pub const RL_FEATURE_HIP_STREAM_PHASE2: u32 = 0x2;
 /// High bit so ICF cannot merge this with `rl_abi_version` (also returns small ints).
 const RL_FEATURE_PRESENT: u32 = 0x1000;
