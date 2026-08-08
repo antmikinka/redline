@@ -1,40 +1,44 @@
-# HIP stream bridge (PR-A phase 1)
+# HIP stream bridge (PR-A phase 1 + phase 2)
 
-**Branch:** `exp/hip-stream-bridge`  
-**Status:** Phase 1 API landed — **host** `hipStreamSynchronize` then replay  
-**Consumers:** lemon-mlx-engine OWN_RMSNORM / dual-queue engines  
+**Branch:** `exp/hip-stream-bridge` on **https://github.com/antmikinka/redline** (pwilkin base)  
+**Consumers:** lemon-mlx-engine OWN_RMSNORM  
 **Contract:** lemonade-sdk `P13_STREAM_BRIDGE_PR.md`
 
 ## API
 
-| Symbol | Role |
-|--------|------|
-| `rl_feature_bits()` | bit `RL_FEATURE_HIP_STREAM_WAIT` (1) if this build exports wait APIs |
-| `rl_gpu_wait_hip_stream(void* hip_stream)` | host-join HIP stream (null = no-op) |
-| `rl_pm4_replay_after_hip_stream(ib, hip_stream)` | wait stream + `rl_pm4_replay` |
+| Symbol | Phase | Role |
+|--------|-------|------|
+| `rl_feature_bits()` | 1+2 | `PRESENT\|WAIT\|PHASE2` (never equals bare `rl_abi_version`) |
+| `rl_gpu_wait_hip_stream` | 1 | host `hipStreamSynchronize` |
+| `rl_pm4_replay_after_hip_stream` | 1 | sync stream + replay |
+| `rl_pm4_replay_after_hip_stream_phase2` | **2** | `WriteValue32` milestone + host poll fence + replay (**no** StreamSynchronize) |
+| `rl_pm4_submit` / `rl_pm4_wait` | 2 | split submit vs completion wait |
 
-Errors: `RL_ERR_HIP` (-8) if libamdhip64 / symbol missing or HIP status ≠ 0.
+Errors: `RL_ERR_HIP` (-8).
 
 ## Phase 1 honesty
 
-This is **ABI + centralization**, not a gen-t/s win by itself:
+Host still joins producers via StreamSynchronize — same class of tax as lemon-mlx PRE.
 
-- Host still joins producers (same cost as lemon-mlx `PRE_SYNC=stream/force`).
-- Product HIP same-stream RMSNorm does **not** host-join; we still do.
+## Phase 2 honesty (current) — **not default for gen**
 
-## Phase 2 (required for PRE tax removal)
+- Uses `hipStreamWriteValue32` + **host DtoH poll** of fence, then replay.
+- Measured **slower** than phase1 on gfx1150 (~13 ms vs ~2.3 ms host for n=31) — poll is a bad join.
+- lemon-mlx uses phase2 only if `MLX_REDLINE_PHASE2=1`; default stays phase1.
+- `rl_pm4_submit` / `rl_pm4_wait` available for 2b async work.
 
-Device-side wait: enqueue dependency on HIP stream completion **without** blocking the CPU for the whole producer interval (HSA signal / queue wait packet / same-queue submit). See lemon-mlx P13 options S/E/Q.
+## Phase 2b (next — true host free)
 
-## Build / install (gfx1150 host)
+1. PM4 `WAIT_REG_MEM` prefix on HSA queue (no host poll)  
+2. Consumer fence + `hipStreamWaitValue32` on product stream  
+3. Host returns without `wait_signal` (async OWN_RMSNORM)
+
+## Build / install
 
 ```bash
 cd /home/antmi/redline
-export PATH=/opt/rocm/core/bin:$PATH
-export LD_LIBRARY_PATH=/opt/rocm/core/lib:${LD_LIBRARY_PATH:-}
+git checkout exp/hip-stream-bridge
+export PATH=/opt/rocm/core/bin:$PATH LD_LIBRARY_PATH=/opt/rocm/core/lib:$LD_LIBRARY_PATH
 cargo build -p redline-capi --release
-mkdir -p /tmp/redline-warpfront-target/release
-cp -a target/release/libredline_dispatch.so target/release/libredline_dispatch.a \
-  /tmp/redline-warpfront-target/release/
-nm -D /tmp/redline-warpfront-target/release/libredline_dispatch.so | grep rl_pm4_replay_after
+cp -a target/release/libredline_dispatch.so /tmp/redline-warpfront-target/release/
 ```

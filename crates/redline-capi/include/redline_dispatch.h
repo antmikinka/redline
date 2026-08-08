@@ -29,8 +29,12 @@
 /** HIP interop failed (missing libamdhip64 or hipStreamSynchronize error). */
 #define RL_ERR_HIP -8
 
-/** Feature bit: rl_pm4_replay_after_hip_stream / rl_gpu_wait_hip_stream present. */
-#define RL_FEATURE_HIP_STREAM_WAIT 1u
+/** Feature bit: phase-1 host stream wait + replay. */
+#define RL_FEATURE_HIP_STREAM_WAIT 0x1u
+/** Feature bit: phase-2 WriteValue milestone + ordered replay (no StreamSynchronize). */
+#define RL_FEATURE_HIP_STREAM_PHASE2 0x2u
+/** Marker bit always set when rl_feature_bits is the real symbol (not ICF-folded). */
+#define RL_FEATURE_PRESENT 0x1000u
 
 /**
  * Optional C-ABI feature bits (OR of RL_FEATURE_*). Probe after dlopen.
@@ -641,6 +645,18 @@ int32_t rl_gpu_wait_hip_stream(void *hip_stream);
  * Same as rl_pm4_replay for `ib`; `hip_stream` null or valid hipStream_t.
  */
 int32_t rl_pm4_replay_after_hip_stream(struct RlPm4Ib *ib, void *hip_stream);
+
+/**
+ * Phase 2: hipStreamWriteValue32 milestone on stream, host-poll fence (no
+ * hipStreamSynchronize), then rl_pm4_replay. Falls back to phase 1 on error.
+ */
+int32_t rl_pm4_replay_after_hip_stream_phase2(struct RlPm4Ib *ib, void *hip_stream);
+
+/** Submit retained IB without waiting (pair with rl_pm4_wait). */
+int32_t rl_pm4_submit(struct RlPm4Ib *ib);
+
+/** Wait for last submit/replay completion on this IB. */
+int32_t rl_pm4_wait(struct RlPm4Ib *ib);
 
 #ifdef __cplusplus
 }  // extern "C"

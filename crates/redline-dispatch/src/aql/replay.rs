@@ -334,6 +334,81 @@ impl SingleQueuePm4Ib {
     }
 
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: caller upholds pointee lifetimes for this retained IB.
+        unsafe { self.submit_inner()? };
+        unsafe { self.wait_inner() }
+    }
+
+    /// Ring doorbell for the retained PM4 IB without waiting for completion.
+    ///
+    /// # Safety
+    /// Same pointee contract as [`Self::replay_and_wait`].
+    pub unsafe fn submit_only(&mut self) -> Result<(), ReplayError> {
+        unsafe { self.submit_inner() }
+    }
+
+    /// Wait for the last [`Self::submit_only`] / replay completion signal.
+    ///
+    /// # Safety
+    /// Must pair with a successful submit on this IB; pointees stay live.
+    pub unsafe fn wait_only(&mut self) -> Result<(), ReplayError> {
+        unsafe { self.wait_inner() }
+    }
+
+    /// Submit optional prefix PM4-IB packets then this retained IB, and wait.
+    ///
+    /// Used for phase-2 HIP ordering: a small WAIT_REG_MEM IB can run on the
+    /// same HSA queue immediately before the retained kernel IB.
+    ///
+    /// # Safety
+    /// Prefix packets and this IB's pointees remain live through the wait.
+    pub unsafe fn replay_and_wait_with_prefix(
+        &mut self,
+        prefix: &[PacketImage],
+    ) -> Result<(), ReplayError> {
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        self.completion.reset();
+        let mut batch = Vec::with_capacity(prefix.len() + self.batch.len());
+        batch.extend_from_slice(prefix);
+        batch.extend_from_slice(&self.batch);
+        if let Err(error) = self.queues.prepare_batches(std::slice::from_ref(&batch)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = self.queues.ring_prepared() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        unsafe { self.wait_inner() }
+    }
+
+    /// Submit prefix + retained IB without host wait (phase-2 async).
+    ///
+    /// # Safety
+    /// Same as [`Self::replay_and_wait_with_prefix`]; caller must [`Self::wait_only`]
+    /// or establish a GPU-side consumer wait before freeing pointees.
+    pub unsafe fn submit_with_prefix(&mut self, prefix: &[PacketImage]) -> Result<(), ReplayError> {
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
+        }
+        self.completion.reset();
+        let mut batch = Vec::with_capacity(prefix.len() + self.batch.len());
+        batch.extend_from_slice(prefix);
+        batch.extend_from_slice(&self.batch);
+        if let Err(error) = self.queues.prepare_batches(std::slice::from_ref(&batch)) {
+            self.usable = false;
+            return Err(error.into());
+        }
+        if let Err(error) = self.queues.ring_prepared() {
+            self.usable = false;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    unsafe fn submit_inner(&mut self) -> Result<(), ReplayError> {
         if !self.usable {
             return Err(ReplayError::GraphInactive);
         }
@@ -348,6 +423,13 @@ impl SingleQueuePm4Ib {
         if let Err(error) = self.queues.ring_prepared() {
             self.usable = false;
             return Err(error.into());
+        }
+        Ok(())
+    }
+
+    unsafe fn wait_inner(&mut self) -> Result<(), ReplayError> {
+        if !self.usable {
+            return Err(ReplayError::GraphInactive);
         }
         match self
             .queues
